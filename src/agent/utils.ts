@@ -13,6 +13,13 @@ export async function createRunContext(
 ): Promise<RunContext> {
   const lastUpdate = await readLastUpdate(cwd);
 
+  if (command === "chat") {
+    return {
+      lastUpdate,
+      gitSummary: "Not applicable for chat.",
+    };
+  }
+
   if (command === "init") {
     return {
       lastUpdate,

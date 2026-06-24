@@ -3,7 +3,7 @@ import { chmod, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { SqliteSaver } from "@langchain/langgraph-checkpoint-sqlite";
 import { ChatOpenRouter } from "@langchain/openrouter";
-import { createDeepAgent, FilesystemBackend } from "deepagents";
+import { createDeepAgent, LocalShellBackend } from "deepagents";
 import { loadOpenWikiEnv, openWikiEnvDir } from "../env.js";
 import { createSystemPrompt, createUserPrompt } from "./prompt.js";
 import type {
@@ -60,8 +60,10 @@ export async function runOpenWikiAgent(
     model,
     tools: [],
     checkpointer,
-    backend: new FilesystemBackend({
+    backend: new LocalShellBackend({
+      maxOutputBytes: 100_000,
       rootDir: cwd,
+      timeout: 120,
       virtualMode: true,
     }),
     systemPrompt: createSystemPrompt(command),
@@ -105,8 +107,12 @@ export async function runOpenWikiAgent(
   emitDebug(options, "stream=completed");
   await chmodIfExists(checkpointPath, 0o600);
 
-  await writeLastUpdateMetadata(command, cwd, modelId);
-  emitDebug(options, "metadata=written");
+  if (command !== "chat") {
+    await writeLastUpdateMetadata(command, cwd, modelId);
+    emitDebug(options, "metadata=written");
+  } else {
+    emitDebug(options, "metadata=skipped command=chat");
+  }
 
   return {
     command,

@@ -1,4 +1,5 @@
 import { isValidModelId, normalizeModelId } from "./constants.js";
+import type { OpenWikiCommand } from "./agent/types.js";
 
 export type HelpRow = {
   label: string;
@@ -21,9 +22,11 @@ export type CliCommand =
   | {
       kind: "run";
       exitCode: 0;
+      command: OpenWikiCommand;
       dryRun: boolean;
       modelId: string | null;
       print: boolean;
+      shouldStart: boolean;
       userMessage: string | null;
     }
   | {
@@ -40,6 +43,7 @@ export function parseCommand(argv: string[]): CliCommand {
   let dryRun = false;
   let modelId: string | null = null;
   let print = false;
+  let command: OpenWikiCommand = "chat";
   const userMessageParts: string[] = [];
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -64,6 +68,21 @@ export function parseCommand(argv: string[]): CliCommand {
 
     if (arg === "--print" || arg === "-p") {
       print = true;
+      continue;
+    }
+
+    if (arg === "--init" || arg === "--update") {
+      const nextCommand = arg === "--init" ? "init" : "update";
+
+      if (command !== "chat" && command !== nextCommand) {
+        return {
+          kind: "error",
+          exitCode: 1,
+          message: "--init and --update cannot be used together.",
+        };
+      }
+
+      command = nextCommand;
       continue;
     }
 
@@ -120,14 +139,27 @@ export function parseCommand(argv: string[]): CliCommand {
     userMessageParts.push(arg);
   }
 
+  const userMessage =
+    userMessageParts.length > 0 ? userMessageParts.join(" ") : null;
+  const shouldStart = command !== "chat" || userMessage !== null;
+
+  if (print && !shouldStart) {
+    return {
+      kind: "error",
+      exitCode: 1,
+      message: "-p, --print requires a message, --init, or --update.",
+    };
+  }
+
   return {
     kind: "run",
     exitCode: 0,
+    command,
     dryRun,
     modelId,
     print,
-    userMessage:
-      userMessageParts.length > 0 ? userMessageParts.join(" ") : null,
+    shouldStart,
+    userMessage,
   };
 }
 
@@ -141,15 +173,27 @@ export const helpContent: HelpContent = {
   title: "OpenWiki",
   description:
     "Run a documentation agent that generates and maintains a project wiki.",
-  usage: ["openwiki [--modelId <model>] [message]"],
+  usage: [
+    "openwiki [--modelId <model>]",
+    "openwiki [--modelId <model>] [message]",
+    "openwiki --init [message]",
+    "openwiki --update [message]",
+  ],
   commands: [
     {
       label: "openwiki",
-      description:
-        "Initialize openwiki/ when missing, otherwise update existing docs.",
+      description: "Open the interactive OpenWiki chat.",
     },
   ],
   options: [
+    {
+      label: "--init",
+      description: "Generate initial OpenWiki documentation.",
+    },
+    {
+      label: "--update",
+      description: "Update existing OpenWiki documentation.",
+    },
     {
       label: "-p, --print",
       description: "Run once and print the final assistant output.",
@@ -167,9 +211,12 @@ export const helpContent: HelpContent = {
   ],
   examples: [
     "openwiki",
+    "openwiki --init",
+    "openwiki --update",
+    'openwiki "What can you do?"',
     'openwiki -p "Summarize what OpenWiki can do"',
     "openwiki --modelId openai/gpt-5.5",
-    'openwiki --modelId openai/gpt-5.5 "Please document the API routes first"',
+    'openwiki --update --modelId openai/gpt-5.5 "Please document the API routes first"',
   ],
   developmentExamples: ["openwiki --dry-run"],
 };

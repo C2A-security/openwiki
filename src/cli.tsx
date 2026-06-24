@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-import { stat } from "node:fs/promises";
-import path from "node:path";
 import React, { useEffect, useRef, useState } from "react";
 import { Box, render, Text, useApp, useInput } from "ink";
 import { marked, type Token, type Tokens } from "marked";
@@ -19,6 +17,7 @@ import {
 import {
   getCredentialDiagnostics,
   loadOpenWikiEnv,
+  saveOpenWikiEnv,
   type CredentialDiagnostic,
 } from "./env.js";
 import { runOpenWikiAgent } from "./agent/index.js";
@@ -28,9 +27,12 @@ import {
 } from "./agent/types.js";
 import {
   DEFAULT_MODEL_ID,
+  isValidModelId,
+  normalizeModelId,
   OPENWIKI_MODEL_ID_ENV_KEY,
   OPENROUTER_API_KEY_ENV_KEY,
   OPEN_WIKI_DIR,
+  SUGGESTED_MODEL_IDS,
 } from "./constants.js";
 import type { OpenWikiCommand } from "./agent/types.js";
 
@@ -39,7 +41,6 @@ const OPENWIKI_VERSION = "0.1.0";
 type RunState =
   | { status: "idle" }
   | { status: "init-setup-saved"; result: InitSetupResult }
-  | { status: "init-declined"; path: string }
   | {
       status: "running";
       command: OpenWikiCommand;
@@ -91,6 +92,9 @@ type AppProps = {
 function App({ command }: AppProps) {
   const app = useApp();
   const startupModelId = command.kind === "run" ? command.modelId : null;
+  const [sessionModelId, setSessionModelId] = useState<string | null>(
+    startupModelId,
+  );
   const activeRunId = useRef(0);
   const mountedRef = useRef(false);
   const nextLogId = useRef(1);
@@ -104,17 +108,51 @@ function App({ command }: AppProps) {
   const [activeUserMessage, setActiveUserMessage] = useState<string | null>(
     command.kind === "run" ? command.userMessage : null,
   );
-  const [activeMessageIsFollowup, setActiveMessageIsFollowup] = useState(false);
+  const [activeMessageIsFollowup, setActiveMessageIsFollowup] = useState(
+    command.kind === "run" && command.command === "chat",
+  );
   const [resolvedCommand, setResolvedCommand] =
-    useState<OpenWikiCommand | null>(null);
-  const [initPromptPath, setInitPromptPath] = useState<string | null>(null);
+    useState<OpenWikiCommand | null>(
+      command.kind === "run" && command.shouldStart ? command.command : null,
+    );
   const shouldRunInteractiveCredentialSetup =
     command.kind === "run" &&
     resolvedCommand !== null &&
     !command.dryRun &&
     process.stdin.isTTY &&
     runState.status === "idle" &&
-    needsCredentialSetup(command.modelId);
+    needsCredentialSetup(sessionModelId);
+  const displayModelId = sessionModelId ?? startupModelId;
+
+  function submitChatMessage(message: string) {
+    if (isExitMessage(message)) {
+      process.exitCode = 0;
+      app.exit();
+      return;
+    }
+
+    setActiveUserMessage(message);
+    setActiveMessageIsFollowup(true);
+    setResolvedCommand("chat");
+    setRunState({ status: "idle" });
+  }
+
+  function submitCommandRun(
+    nextCommand: Extract<OpenWikiCommand, "init" | "update">,
+    message: string | null,
+  ) {
+    setActiveUserMessage(message);
+    setActiveMessageIsFollowup(false);
+    setResolvedCommand(nextCommand);
+    setRunState({ status: "idle" });
+  }
+
+  async function selectModel(modelId: string) {
+    await saveOpenWikiEnv({
+      [OPENWIKI_MODEL_ID_ENV_KEY]: modelId,
+    });
+    setSessionModelId(modelId);
+  }
 
   useEffect(() => {
     mountedRef.current = true;
@@ -142,48 +180,6 @@ function App({ command }: AppProps) {
     }
 
     if (resolvedCommand === null) {
-      if (initPromptPath !== null) {
-        return;
-      }
-
-      resolveRunCommand(process.cwd())
-        .then((nextCommand) => {
-          if (!mountedRef.current) {
-            return;
-          }
-
-          if (nextCommand === "init") {
-            if (!process.stdin.isTTY) {
-              setRunState({
-                status: "error",
-                message: `No OpenWiki detected at ${path.join(
-                  process.cwd(),
-                  OPEN_WIKI_DIR,
-                )}. Run openwiki in an interactive terminal to initialize it.`,
-              });
-              return;
-            }
-
-            setInitPromptPath(path.join(process.cwd(), OPEN_WIKI_DIR));
-            return;
-          }
-
-          setResolvedCommand(nextCommand);
-        })
-        .catch((error: unknown) => {
-          if (!mountedRef.current) {
-            return;
-          }
-
-          setRunState({
-            status: "error",
-            message:
-              error instanceof Error
-                ? error.message
-                : "Failed to inspect OpenWiki directory.",
-          });
-        });
-
       return;
     }
 
@@ -240,7 +236,7 @@ function App({ command }: AppProps) {
     runOpenWikiAgent(resolvedCommand, process.cwd(), {
       debug: isDebugMode(),
       isFollowup: activeMessageIsFollowup,
-      modelId: command.modelId,
+      modelId: sessionModelId,
       userMessage: activeUserMessage,
       onEvent: (event) => {
         if (!mountedRef.current || activeRunId.current !== runId) {
@@ -314,9 +310,9 @@ function App({ command }: AppProps) {
     command,
     activeMessageIsFollowup,
     activeUserMessage,
-    initPromptPath,
     resolvedCommand,
     runState.status,
+    sessionModelId,
     shouldRunInteractiveCredentialSetup,
   ]);
 
@@ -325,11 +321,6 @@ function App({ command }: AppProps) {
       process.exitCode = 1;
       app.exit();
       return;
-    }
-
-    if (runState.status === "init-declined") {
-      process.exitCode = 0;
-      app.exit();
     }
   }, [app, runState.status]);
 
@@ -349,25 +340,11 @@ function App({ command }: AppProps) {
 
   if (command.kind === "run" && command.dryRun) {
     return (
-      <DryRunView modelId={command.modelId} userMessage={command.userMessage} />
-    );
-  }
-
-  if (command.kind === "run" && initPromptPath !== null) {
-    return (
-      <InitializePrompt
-        path={initPromptPath}
-        onAccept={() => {
-          setInitPromptPath(null);
-          setResolvedCommand("init");
-        }}
-        onDecline={() => {
-          setInitPromptPath(null);
-          setRunState({
-            status: "init-declined",
-            path: initPromptPath,
-          });
-        }}
+      <DryRunView
+        command={command.command}
+        modelId={command.modelId}
+        shouldStart={command.shouldStart}
+        userMessage={command.userMessage}
       />
     );
   }
@@ -377,6 +354,10 @@ function App({ command }: AppProps) {
       <InitSetup
         modelIdOverride={command.modelId}
         onComplete={(result) => {
+          if (result.modelId) {
+            setSessionModelId(result.modelId);
+          }
+
           setRunState({ status: "init-setup-saved", result });
         }}
         onError={(message) => {
@@ -390,7 +371,7 @@ function App({ command }: AppProps) {
     return (
       <Box flexDirection="column">
         <Header
-          modelId={runState.result.modelId ?? startupModelId}
+          modelId={runState.result.modelId ?? displayModelId}
           subtitle="Credential setup"
         />
         {runState.result.savedOpenRouterKey ||
@@ -410,19 +391,6 @@ function App({ command }: AppProps) {
     );
   }
 
-  if (runState.status === "init-declined") {
-    return (
-      <Box flexDirection="column">
-        <Header modelId={startupModelId} subtitle="Initialization skipped" />
-        <StatusLine
-          tone="muted"
-          label="OpenWiki"
-          value={`No documentation was created at ${runState.path}.`}
-        />
-      </Box>
-    );
-  }
-
   if (runState.status === "running") {
     return (
       <Box flexDirection="column">
@@ -432,7 +400,7 @@ function App({ command }: AppProps) {
           credentialDiagnostics={runState.credentialDiagnostics}
           log={runState.log}
           message={activeUserMessage}
-          modelId={startupModelId}
+          modelId={displayModelId}
         />
       </Box>
     );
@@ -447,18 +415,10 @@ function App({ command }: AppProps) {
         />
         <ChatHistory runs={completedRuns} />
         <ChatInput
-          onSubmit={(message) => {
-            if (isExitMessage(message)) {
-              process.exitCode = 0;
-              app.exit();
-              return;
-            }
-
-            setActiveUserMessage(message);
-            setActiveMessageIsFollowup(true);
-            setResolvedCommand("update");
-            setRunState({ status: "idle" });
-          }}
+          currentModelId={getDisplayModelId(displayModelId)}
+          onCommandRun={submitCommandRun}
+          onModelSelect={selectModel}
+          onSubmit={submitChatMessage}
         />
       </Box>
     );
@@ -467,7 +427,7 @@ function App({ command }: AppProps) {
   if (runState.status === "idle" && completedRuns.length > 0) {
     return (
       <Box flexDirection="column">
-        <Header modelId={startupModelId} subtitle="Starting follow-up" />
+        <Header modelId={displayModelId} subtitle="Starting follow-up" />
         <ChatHistory runs={completedRuns} />
         {activeUserMessage ? <PromptBlock message={activeUserMessage} /> : null}
         <StatusLine tone="active" label="Next" value="starting openwiki" />
@@ -478,7 +438,7 @@ function App({ command }: AppProps) {
   if (runState.status === "error") {
     return (
       <Box flexDirection="column">
-        <Header modelId={startupModelId} subtitle="Run failed" />
+        <Header modelId={displayModelId} subtitle="Run failed" />
         <StatusLine tone="error" label="Error" value={runState.message} />
         {runState.credentialDiagnostics ? (
           <CredentialDiagnosticsPanel
@@ -494,7 +454,13 @@ function App({ command }: AppProps) {
 
   return (
     <Box flexDirection="column">
-      <Header modelId={startupModelId} subtitle="Starting" />
+      <Header modelId={displayModelId} subtitle="Ready for chat" />
+      <ChatInput
+        currentModelId={getDisplayModelId(displayModelId)}
+        onCommandRun={submitCommandRun}
+        onModelSelect={selectModel}
+        onSubmit={submitChatMessage}
+      />
     </Box>
   );
 }
@@ -539,22 +505,26 @@ function HelpView() {
 }
 
 function DryRunView({
+  command,
   modelId,
+  shouldStart,
   userMessage,
 }: {
+  command: OpenWikiCommand;
   modelId: string | null;
+  shouldStart: boolean;
   userMessage: string | null;
 }) {
   return (
     <Box flexDirection="column">
       <Header modelId={modelId} subtitle="Development dry run" />
       <Panel title="Execution Plan">
-        <StatusLine tone="active" label="Command" value="openwiki" />
         <StatusLine
-          tone="muted"
-          label="Mode"
-          value={`resolved from ${OPEN_WIKI_DIR}/ existence`}
+          tone="active"
+          label="Command"
+          value={`openwiki ${command}`}
         />
+        <StatusLine tone="muted" label="Mode" value={command} />
         <StatusLine
           tone="muted"
           label="Credentials"
@@ -568,74 +538,15 @@ function DryRunView({
         <StatusLine tone="muted" label="Agent" value="not invoked" />
         <StatusLine tone="muted" label="Writes" value="no files or metadata" />
         <StatusLine tone="muted" label="Output" value={`${OPEN_WIKI_DIR}/`} />
+        <StatusLine
+          tone="muted"
+          label="Startup"
+          value={shouldStart ? "would start run" : "would open chat"}
+        />
         {userMessage ? (
           <StatusLine tone="muted" label="Message" value={userMessage} />
         ) : null}
       </Panel>
-    </Box>
-  );
-}
-
-type InitializePromptProps = {
-  path: string;
-  onAccept: () => void;
-  onDecline: () => void;
-};
-
-function InitializePrompt({
-  path,
-  onAccept,
-  onDecline,
-}: InitializePromptProps) {
-  const [input, setInput] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
-  useInput((inputValue, key) => {
-    if (key.return) {
-      const answer = parseYesNoAnswer(input);
-
-      if (answer === null) {
-        setError("Enter yes or no.");
-        return;
-      }
-
-      if (answer) {
-        onAccept();
-        return;
-      }
-
-      onDecline();
-      return;
-    }
-
-    if (key.backspace || key.delete) {
-      setInput((value) => value.slice(0, -1));
-      return;
-    }
-
-    if (inputValue && !key.ctrl && !key.meta) {
-      setInput((value) => value + inputValue);
-    }
-  });
-
-  return (
-    <Box flexDirection="column">
-      <Header modelId={null} subtitle="No OpenWiki detected" />
-      <Panel title="Initialize">
-        <Text>
-          No OpenWiki detected. Would you like to initialize a new project at{" "}
-          {path}?
-        </Text>
-        <Text>
-          <Text color="gray">$</Text> Initialize OpenWiki?{" "}
-          <Text color="cyan">Y/n</Text> {input}
-        </Text>
-      </Panel>
-      {error ? (
-        <Panel title="Error">
-          <Text color="red">{error}</Text>
-        </Panel>
-      ) : null}
     </Box>
   );
 }
@@ -804,6 +715,25 @@ function RunView({
   message = null,
   modelId = null,
 }: RunViewProps) {
+  const [animationFrame, setAnimationFrame] = useState(0);
+  const hasRunningTool = log.some(
+    (item) => item.type === "tool" && item.status === "running",
+  );
+
+  useEffect(() => {
+    if (done || !hasRunningTool) {
+      return;
+    }
+
+    const interval = setInterval(() => {
+      setAnimationFrame((frame) => frame + 1);
+    }, 140);
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, [done, hasRunningTool]);
+
   return (
     <Box flexDirection="column">
       <Header
@@ -820,7 +750,13 @@ function RunView({
         </Text>
         <Box flexDirection="column" marginLeft={2} marginTop={1}>
           {log.length > 0 ? (
-            log.map((item) => <RunLogLine item={item} key={item.id} />)
+            log.map((item) => (
+              <RunLogLine
+                animationFrame={animationFrame}
+                item={item}
+                key={item.id}
+              />
+            ))
           ) : (
             <Text color="gray">Waiting for model output...</Text>
           )}
@@ -833,24 +769,54 @@ function RunView({
   );
 }
 
-function RunLogLine({ item }: { item: RunLogItem }) {
+function RunLogLine({
+  animationFrame = 0,
+  item,
+}: {
+  animationFrame?: number;
+  item: RunLogItem;
+}) {
   if (item.type === "tool") {
-    const color =
-      item.status === "error"
-        ? "red"
-        : item.status === "running"
-          ? "yellow"
-          : "magenta";
+    if (item.status === "running") {
+      return (
+        <Box flexDirection="column" marginBottom={1}>
+          <Text>
+            <Text bold color="cyan">
+              {">> "}
+            </Text>
+            <AnimatedToolText
+              frame={animationFrame + item.id}
+              text={item.content}
+            />
+          </Text>
+          {item.call ? (
+            <Text color="gray"> {truncateLogOutput(item.call, "")}</Text>
+          ) : null}
+        </Box>
+      );
+    }
+
+    if (item.status === "error") {
+      return (
+        <Box flexDirection="column" marginBottom={1}>
+          <Text>
+            <Text bold color="red">
+              {"!! "}
+            </Text>
+            <Text bold color="red">
+              {item.content}
+            </Text>
+          </Text>
+        </Box>
+      );
+    }
 
     return (
       <Box flexDirection="column" marginBottom={1}>
         <Text>
-          <Text color={color}>* </Text>
-          <Text bold>{item.content}</Text>
+          <Text color="gray">{"ok "}</Text>
+          <Text color="gray">{item.content}</Text>
         </Text>
-        {item.status === "running" && item.call ? (
-          <Text color="gray"> | {truncateLogOutput(item.call, "")}</Text>
-        ) : null}
       </Box>
     );
   }
@@ -871,6 +837,36 @@ function RunLogLine({ item }: { item: RunLogItem }) {
         <MarkdownText markdown={item.content.trim()} />
       </Box>
     </Box>
+  );
+}
+
+function AnimatedToolText({ frame, text }: { frame: number; text: string }) {
+  const highlightIndex = frame % Math.max(text.length + 6, 1);
+
+  return (
+    <>
+      {Array.from(text).map((character, index) => {
+        const distance = Math.abs(index - highlightIndex);
+        const color =
+          distance === 0
+            ? "white"
+            : distance === 1
+              ? "cyan"
+              : distance === 2
+                ? "yellow"
+                : "gray";
+
+        return (
+          <Text
+            bold={distance <= 1}
+            color={color}
+            key={`${index}-${character}`}
+          >
+            {character}
+          </Text>
+        );
+      })}
+    </>
   );
 }
 
@@ -1078,63 +1074,677 @@ function ChatHistory({ runs }: { runs: CompletedRun[] }) {
               <Text color="gray">No assistant output captured.</Text>
             )}
           </Box>
-          <Divider />
         </Box>
       ))}
     </Box>
   );
 }
 
-function ChatInput({ onSubmit }: { onSubmit: (message: string) => void }) {
-  const [input, setInput] = useState("");
+type ChatInputProps = {
+  currentModelId: string;
+  onCommandRun: (
+    command: Extract<OpenWikiCommand, "init" | "update">,
+    message: string | null,
+  ) => void;
+  onModelSelect: (modelId: string) => Promise<void>;
+  onSubmit: (message: string) => void;
+};
+
+function ChatInput({
+  currentModelId,
+  onCommandRun,
+  onModelSelect,
+  onSubmit,
+}: ChatInputProps) {
+  const [inputState, setInputState] = useState<ChatInputState>({
+    cursorPosition: 0,
+    value: "",
+  });
+  const [menuState, setMenuState] = useState<ChatInputMenuState>({
+    kind: "none",
+  });
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const input = inputState.value;
+  const cursorPosition = inputState.cursorPosition;
+
+  useEffect(() => {
+    setMenuState((currentState) =>
+      syncMenuStateForInput(input, currentState, currentModelId),
+    );
+  }, [currentModelId, input]);
 
   useInput((inputValue, key) => {
-    if (key.return) {
-      const message = input.trim();
-
-      if (message.length === 0) {
-        setError("Enter a follow-up message.");
-        return;
-      }
-
-      setError(null);
-      setInput("");
-      onSubmit(message);
+    if (isSaving) {
       return;
     }
 
-    if (key.backspace || key.delete) {
-      setInput((value) => value.slice(0, -1));
+    if (isMenuUpInput(inputValue, key) && menuState.kind !== "none") {
+      setMenuState((state) => moveMenuSelection(state, -1, currentModelId));
+      return;
+    }
+
+    if (isMenuDownInput(inputValue, key) && menuState.kind !== "none") {
+      setMenuState((state) => moveMenuSelection(state, 1, currentModelId));
+      return;
+    }
+
+    if (key.return) {
+      void submitInput();
+      return;
+    }
+
+    if (inputValue === "\u001b" && menuState.kind !== "none") {
+      resetInput();
+      return;
+    }
+
+    if (key.leftArrow) {
+      setInputState((state) => moveInputCursor(state, -1));
+      return;
+    }
+
+    if (key.rightArrow) {
+      setInputState((state) => moveInputCursor(state, 1));
+      return;
+    }
+
+    if ((key.ctrl && inputValue === "a") || inputValue === "\u0001") {
+      setInputState((state) => ({
+        ...state,
+        cursorPosition: 0,
+      }));
+      return;
+    }
+
+    if ((key.ctrl && inputValue === "e") || inputValue === "\u0005") {
+      setInputState((state) => ({
+        ...state,
+        cursorPosition: state.value.length,
+      }));
+      return;
+    }
+
+    if (key.backspace || isRawBackspaceInput(inputValue)) {
+      setInputState(deleteBeforeInputCursor);
+      return;
+    }
+
+    if (key.delete) {
+      setInputState(
+        inputValue.length === 0 ? deleteBeforeInputCursor : deleteAtInputCursor,
+      );
       return;
     }
 
     if (inputValue && !key.ctrl && !key.meta) {
-      setInput((value) => value + inputValue);
+      setError(null);
+      setNotice(null);
+      setInputState((state) => applyRawInputValue(state, inputValue));
     }
   });
 
+  async function submitInput() {
+    const message = input.trim();
+
+    if (message.length === 0) {
+      setError("Enter a follow-up message.");
+      return;
+    }
+
+    if (message.startsWith("/")) {
+      await submitSlashInput(message);
+      return;
+    }
+
+    resetInput();
+    onSubmit(message);
+  }
+
+  async function submitSlashInput(message: string) {
+    if (message === "/" && menuState.kind === "commands") {
+      await runSlashCommand(slashCommandOptions[menuState.selectedIndex]);
+      return;
+    }
+
+    if (message === "/model" && menuState.kind === "model") {
+      await selectModelMenuOption(menuState.selectedIndex);
+      return;
+    }
+
+    const parsedCommand = parseSlashInput(message);
+
+    if (parsedCommand === null) {
+      setError(`Unknown command: ${message}`);
+      return;
+    }
+
+    await runSlashCommand(
+      parsedCommand.option,
+      parsedCommand.args.length > 0 ? parsedCommand.args : null,
+    );
+  }
+
+  async function runSlashCommand(
+    option: SlashCommandOption | undefined,
+    args: string | null = null,
+  ) {
+    if (!option) {
+      setError("Select a slash command.");
+      return;
+    }
+
+    if (option.id === "model") {
+      if (args && args.length > 0) {
+        await saveModelSelection(args);
+        return;
+      }
+
+      setError(null);
+      setNotice("Choose a model, or type /model <model-id>.");
+      setInputValue("/model");
+      setMenuState({
+        kind: "model",
+        selectedIndex: getCurrentModelOptionIndex(currentModelId),
+      });
+      return;
+    }
+
+    if (option.id === "init" || option.id === "update") {
+      resetInput();
+      onCommandRun(option.id, args);
+      return;
+    }
+
+    if (option.id === "help") {
+      resetInput();
+      setNotice(
+        "Slash commands: /model, /init, /update, /help, /exit. Use arrows to select.",
+      );
+      return;
+    }
+
+    resetInput();
+    onSubmit("/exit");
+  }
+
+  async function selectModelMenuOption(selectedIndex: number) {
+    const option = getModelMenuOptions(currentModelId)[selectedIndex];
+
+    if (!option) {
+      setError("Select a model.");
+      return;
+    }
+
+    if (option.kind === "custom") {
+      setError(null);
+      setNotice("Type a custom OpenRouter model ID after /model.");
+      setInputValue("/model ");
+      return;
+    }
+
+    await saveModelSelection(option.modelId);
+  }
+
+  async function saveModelSelection(rawModelId: string) {
+    const modelId = normalizeModelId(rawModelId);
+
+    if (!isValidModelId(modelId)) {
+      setError("Enter a valid OpenRouter model ID.");
+      return;
+    }
+
+    setIsSaving(true);
+    setError(null);
+    setNotice(null);
+
+    try {
+      await onModelSelect(modelId);
+      resetInput();
+      setNotice(`Model switched to ${modelId}.`);
+    } catch (saveError) {
+      setError(
+        saveError instanceof Error
+          ? saveError.message
+          : "Failed to save model selection.",
+      );
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  function resetInput() {
+    setInputState({ cursorPosition: 0, value: "" });
+    setMenuState({ kind: "none" });
+    setError(null);
+  }
+
+  function setInputValue(value: string) {
+    setInputState({
+      cursorPosition: value.length,
+      value,
+    });
+  }
+
+  const beforeCursor = input.slice(0, cursorPosition);
+  const afterCursor = input.slice(cursorPosition);
+
   return (
     <Box flexDirection="column" marginTop={1}>
-      <Divider />
       <Box borderStyle="single" borderColor="blue" paddingX={1}>
         <Text>
           <Text color="blue">{">"}</Text>{" "}
           {input.length > 0 ? (
-            input
+            <>
+              {beforeCursor}
+              <InputCursor />
+              {afterCursor}
+            </>
           ) : (
-            <Text color="gray">Ask a follow-up...</Text>
+            <>
+              <InputCursor />
+              <Text color="gray"> Ask a follow-up...</Text>
+            </>
           )}
         </Text>
       </Box>
       <Text>
         <Text color="gray">
-          enter to send - /exit to quit - cwd {formatCwd(process.cwd())}
+          enter to send - / for commands - /exit to quit - cwd{" "}
+          {formatCwd(process.cwd())}
         </Text>
       </Text>
+      {menuState.kind !== "none" ? (
+        <SlashMenu
+          currentModelId={currentModelId}
+          input={input}
+          menuState={menuState}
+        />
+      ) : null}
+      {notice ? <Text color="green">{notice}</Text> : null}
+      {isSaving ? <Text color="gray">Saving model selection...</Text> : null}
       {error ? <Text color="red">{error}</Text> : null}
     </Box>
   );
+}
+
+type ChatInputState = {
+  cursorPosition: number;
+  value: string;
+};
+
+type ChatInputMenuState =
+  | { kind: "commands"; selectedIndex: number }
+  | { kind: "model"; selectedIndex: number }
+  | { kind: "none" };
+
+type SlashCommandId = "exit" | "help" | "init" | "model" | "update";
+
+type SlashCommandOption = {
+  description: string;
+  id: SlashCommandId;
+  label: string;
+};
+
+type ModelMenuOption =
+  | {
+      kind: "model";
+      label: string;
+      modelId: string;
+    }
+  | {
+      kind: "custom";
+      label: string;
+    };
+
+const slashCommandOptions: SlashCommandOption[] = [
+  {
+    description: "Switch the OpenRouter model",
+    id: "model",
+    label: "/model",
+  },
+  {
+    description: "Run an initial OpenWiki documentation pass",
+    id: "init",
+    label: "/init",
+  },
+  {
+    description: "Update existing OpenWiki documentation",
+    id: "update",
+    label: "/update",
+  },
+  {
+    description: "Show slash command help",
+    id: "help",
+    label: "/help",
+  },
+  {
+    description: "Exit OpenWiki",
+    id: "exit",
+    label: "/exit",
+  },
+];
+
+function SlashMenu({
+  currentModelId,
+  input,
+  menuState,
+}: {
+  currentModelId: string;
+  input: string;
+  menuState: Exclude<ChatInputMenuState, { kind: "none" }>;
+}) {
+  if (menuState.kind === "model") {
+    const modelOptions = getModelMenuOptions(currentModelId);
+
+    return (
+      <Box flexDirection="column" marginTop={1}>
+        <Text color="gray">Models</Text>
+        {modelOptions.map((option, index) => (
+          <MenuRow
+            description={
+              option.kind === "model" && option.modelId === currentModelId
+                ? "current"
+                : option.kind === "custom"
+                  ? "type /model <model-id>"
+                  : ""
+            }
+            isSelected={index === menuState.selectedIndex}
+            key={option.label}
+            label={option.label}
+          />
+        ))}
+        {input.startsWith("/model ") ? (
+          <Text color="gray">Press enter to save the custom model ID.</Text>
+        ) : (
+          <Text color="gray">Use arrows, enter to select, esc to cancel.</Text>
+        )}
+      </Box>
+    );
+  }
+
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      <Text color="gray">Commands</Text>
+      {slashCommandOptions.map((option, index) => (
+        <MenuRow
+          description={option.description}
+          isSelected={index === menuState.selectedIndex}
+          key={option.id}
+          label={option.label}
+        />
+      ))}
+      <Text color="gray">Use arrows, enter to select, esc to cancel.</Text>
+    </Box>
+  );
+}
+
+function MenuRow({
+  description,
+  isSelected,
+  label,
+}: {
+  description: string;
+  isSelected: boolean;
+  label: string;
+}) {
+  return (
+    <Text>
+      <Text color={isSelected ? "cyan" : "gray"}>{isSelected ? ">" : " "}</Text>{" "}
+      <Text bold={isSelected}>{label.padEnd(28)}</Text>
+      <Text color="gray">{description}</Text>
+    </Text>
+  );
+}
+
+function moveInputCursor(
+  state: ChatInputState,
+  offset: number,
+): ChatInputState {
+  return {
+    ...state,
+    cursorPosition: clampCursorPosition(
+      state.cursorPosition + offset,
+      state.value,
+    ),
+  };
+}
+
+function deleteBeforeInputCursor(state: ChatInputState): ChatInputState {
+  if (state.cursorPosition === 0) {
+    return state;
+  }
+
+  return {
+    cursorPosition: state.cursorPosition - 1,
+    value: `${state.value.slice(0, state.cursorPosition - 1)}${state.value.slice(
+      state.cursorPosition,
+    )}`,
+  };
+}
+
+function deleteAtInputCursor(state: ChatInputState): ChatInputState {
+  if (state.cursorPosition >= state.value.length) {
+    return state;
+  }
+
+  return {
+    ...state,
+    value: `${state.value.slice(0, state.cursorPosition)}${state.value.slice(
+      state.cursorPosition + 1,
+    )}`,
+  };
+}
+
+function applyRawInputValue(
+  state: ChatInputState,
+  inputValue: string,
+): ChatInputState {
+  let nextState = state;
+
+  for (let index = 0; index < inputValue.length; index += 1) {
+    if (inputValue.startsWith("\u001b[D", index)) {
+      nextState = moveInputCursor(nextState, -1);
+      index += 2;
+      continue;
+    }
+
+    if (inputValue.startsWith("\u001b[C", index)) {
+      nextState = moveInputCursor(nextState, 1);
+      index += 2;
+      continue;
+    }
+
+    if (inputValue.startsWith("\u001b[3~", index)) {
+      nextState = deleteAtInputCursor(nextState);
+      index += 3;
+      continue;
+    }
+
+    if (
+      inputValue.startsWith("\u007f", index) ||
+      inputValue.startsWith("\b", index)
+    ) {
+      nextState = deleteBeforeInputCursor(nextState);
+      continue;
+    }
+
+    if (
+      inputValue.startsWith("\u001b[A", index) ||
+      inputValue.startsWith("\u001b[B", index)
+    ) {
+      index += 2;
+      continue;
+    }
+
+    const character = inputValue[index];
+
+    if (isControlCharacter(character)) {
+      continue;
+    }
+
+    nextState = insertAtInputCursor(nextState, character);
+  }
+
+  return nextState;
+}
+
+function insertAtInputCursor(
+  state: ChatInputState,
+  character: string,
+): ChatInputState {
+  return {
+    cursorPosition: state.cursorPosition + character.length,
+    value: `${state.value.slice(0, state.cursorPosition)}${character}${state.value.slice(
+      state.cursorPosition,
+    )}`,
+  };
+}
+
+function clampCursorPosition(position: number, value: string): number {
+  return Math.max(0, Math.min(value.length, position));
+}
+
+function isControlCharacter(character: string): boolean {
+  const codePoint = character.codePointAt(0);
+
+  return codePoint !== undefined && codePoint < 32;
+}
+
+function isRawBackspaceInput(inputValue: string): boolean {
+  return inputValue === "\u007f" || inputValue === "\b";
+}
+
+function syncMenuStateForInput(
+  input: string,
+  currentState: ChatInputMenuState,
+  currentModelId: string,
+): ChatInputMenuState {
+  if (input.startsWith("/model")) {
+    const selectedIndex =
+      currentState.kind === "model"
+        ? currentState.selectedIndex
+        : getCurrentModelOptionIndex(currentModelId);
+
+    return {
+      kind: "model",
+      selectedIndex: clampMenuIndex(
+        selectedIndex,
+        getModelMenuOptions(currentModelId).length,
+      ),
+    };
+  }
+
+  if (input.startsWith("/")) {
+    const selectedIndex =
+      currentState.kind === "commands"
+        ? currentState.selectedIndex
+        : getCommandOptionIndex(input);
+
+    return {
+      kind: "commands",
+      selectedIndex: clampMenuIndex(selectedIndex, slashCommandOptions.length),
+    };
+  }
+
+  return { kind: "none" };
+}
+
+function moveMenuSelection(
+  menuState: ChatInputMenuState,
+  offset: number,
+  currentModelId: string,
+): ChatInputMenuState {
+  if (menuState.kind === "none") {
+    return menuState;
+  }
+
+  const itemCount =
+    menuState.kind === "model"
+      ? getModelMenuOptions(currentModelId).length
+      : slashCommandOptions.length;
+
+  return {
+    ...menuState,
+    selectedIndex: wrapMenuIndex(menuState.selectedIndex + offset, itemCount),
+  };
+}
+
+function getCommandOptionIndex(input: string): number {
+  const matchingIndex = slashCommandOptions.findIndex((option) =>
+    option.label.startsWith(input),
+  );
+
+  return matchingIndex === -1 ? 0 : matchingIndex;
+}
+
+function getCurrentModelOptionIndex(currentModelId: string): number {
+  const matchingIndex = getModelMenuOptions(currentModelId).findIndex(
+    (option) => option.kind === "model" && option.modelId === currentModelId,
+  );
+
+  return matchingIndex === -1 ? 0 : matchingIndex;
+}
+
+function getModelMenuOptions(currentModelId: string): ModelMenuOption[] {
+  const modelIds = Array.from(
+    new Set([currentModelId, ...SUGGESTED_MODEL_IDS].filter(Boolean)),
+  );
+
+  return [
+    ...modelIds.map((modelId) => ({
+      kind: "model" as const,
+      label: modelId,
+      modelId,
+    })),
+    {
+      kind: "custom" as const,
+      label: "Custom model ID",
+    },
+  ];
+}
+
+function parseSlashInput(
+  input: string,
+): { args: string; option: SlashCommandOption } | null {
+  const trimmedInput = input.trim();
+  const [commandName = "", ...args] = trimmedInput.split(/\s+/u);
+  const option = slashCommandOptions.find(
+    (commandOption) => commandOption.label === commandName,
+  );
+
+  return option ? { args: args.join(" "), option } : null;
+}
+
+function isMenuUpInput(
+  inputValue: string,
+  key: Parameters<Parameters<typeof useInput>[0]>[1],
+): boolean {
+  return key.upArrow || inputValue === "\u001b[A";
+}
+
+function isMenuDownInput(
+  inputValue: string,
+  key: Parameters<Parameters<typeof useInput>[0]>[1],
+): boolean {
+  return key.downArrow || inputValue === "\u001b[B";
+}
+
+function clampMenuIndex(index: number, itemCount: number): number {
+  return Math.max(0, Math.min(Math.max(0, itemCount - 1), index));
+}
+
+function wrapMenuIndex(index: number, itemCount: number): number {
+  if (itemCount <= 0) {
+    return 0;
+  }
+
+  return ((index % itemCount) + itemCount) % itemCount;
+}
+
+function InputCursor() {
+  return <Text color="cyan">|</Text>;
 }
 
 function PromptBlock({ message }: { message: string }) {
@@ -1146,10 +1756,6 @@ function PromptBlock({ message }: { message: string }) {
       </Text>
     </Box>
   );
-}
-
-function Divider() {
-  return <Text color="gray">{createDivider()}</Text>;
 }
 
 function updateRunningCredentialDiagnostics(
@@ -1507,12 +2113,6 @@ function truncateToDisplayLines(
   return lines.join("\n");
 }
 
-function createDivider(): string {
-  const terminalColumns = process.stdout.columns ?? 80;
-
-  return "-".repeat(Math.max(24, Math.min(terminalColumns, 120)));
-}
-
 function formatCwd(cwd: string): string {
   const home = process.env.HOME;
 
@@ -1531,32 +2131,8 @@ function shouldShowCredentialDiagnostics(): boolean {
   return isDebugMode() || process.env.OPENWIKI_DEBUG_CREDENTIALS === "1";
 }
 
-async function resolveRunCommand(cwd: string): Promise<OpenWikiCommand> {
-  try {
-    const directoryStats = await stat(path.join(cwd, OPEN_WIKI_DIR));
-
-    return directoryStats.isDirectory() ? "update" : "init";
-  } catch (error) {
-    if (isFileNotFoundError(error)) {
-      return "init";
-    }
-
-    throw error;
-  }
-}
-
-function parseYesNoAnswer(value: string): boolean | null {
-  const answer = value.trim().toLowerCase();
-
-  if (answer.length === 0 || answer === "y" || answer === "yes") {
-    return true;
-  }
-
-  if (answer === "n" || answer === "no") {
-    return false;
-  }
-
-  return null;
+function getDisplayModelId(modelId: string | null): string {
+  return modelId ?? process.env[OPENWIKI_MODEL_ID_ENV_KEY] ?? DEFAULT_MODEL_ID;
 }
 
 function getErrorDiagnostics(error: unknown): ErrorDiagnostic[] {
@@ -1708,14 +2284,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isFileNotFoundError(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    "code" in error &&
-    (error as NodeJS.ErrnoException).code === "ENOENT"
-  );
-}
-
 function getErrorMessage(error: unknown): string {
   const message =
     error instanceof Error ? error.message : "OpenWiki agent run failed.";
@@ -1845,11 +2413,11 @@ async function runPrintCommand(
   command: Extract<CliCommand, { kind: "run" }>,
 ): Promise<void> {
   try {
-    const resolvedCommand = await resolveRunCommand(process.cwd());
     const output: string[] = [];
 
-    await runOpenWikiAgent(resolvedCommand, process.cwd(), {
+    await runOpenWikiAgent(command.command, process.cwd(), {
       debug: false,
+      isFollowup: command.command === "chat",
       modelId: command.modelId,
       userMessage: command.userMessage,
       onEvent: (event) => {
@@ -1876,6 +2444,7 @@ function resolveStartupCommand(command: CliCommand): CliCommand {
   if (
     command.kind === "run" &&
     !command.dryRun &&
+    command.shouldStart &&
     (command.print || !process.stdin.isTTY)
   ) {
     const hasOpenRouterKey = Boolean(process.env[OPENROUTER_API_KEY_ENV_KEY]);

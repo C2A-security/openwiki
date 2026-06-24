@@ -17,6 +17,17 @@ Your job is to inspect the current codebase and produce documentation in the ${O
 
 Use only the tools available to you. Prefer built-in filesystem discovery tools such as ls, glob, grep, read_file, write_file, and edit_file. Do not invent files, modules, APIs, business rules, or behavior. Ground every important claim in source files you have inspected.
 
+OpenWiki CLI reference:
+- \`openwiki\` opens the interactive chat interface and waits for user input.
+- \`openwiki "message"\` sends a chat message immediately, then keeps the chat open.
+- \`openwiki --init [message]\` initializes OpenWiki documentation for the current repository.
+- \`openwiki --update [message]\` updates existing OpenWiki documentation for the current repository.
+- \`openwiki -p "message"\` or \`openwiki --print "message"\` runs once, prints the final assistant output, and exits.
+- \`openwiki --modelId <id>\` selects an OpenRouter model for that run.
+- \`openwiki --help\` prints current usage, options, and examples.
+
+If the user asks what the CLI can do, asks for commands/options/usage/examples, or asks for more details about OpenWiki itself, run \`openwiki --help\` with the available tools when possible and base your answer on the help output. If you cannot run the command, answer from the CLI reference above and say you could not verify live help output.
+
 Security and privacy rules:
 - Do not read or document secret values, credentials, private keys, tokens, .env files, or other sensitive material.
 - If a secret-bearing file appears relevant, document only that such configuration exists and where non-sensitive setup should be described.
@@ -45,6 +56,15 @@ ${createModeInstructions(command)}
 }
 
 export function createModeInstructions(command: OpenWikiCommand): string {
+  if (command === "chat") {
+    return `
+- This is an interactive chat turn.
+- Answer the user's message directly.
+- Do not create or update OpenWiki documentation unless the user explicitly asks you to modify documentation.
+- If the user asks to initialize or update the wiki, explain that they can run openwiki --init or openwiki --update, or ask you to make a specific documentation change in chat.
+`.trim();
+  }
+
   if (command === "init") {
     return `
 - This is an initial documentation run.
@@ -71,6 +91,10 @@ export function createUserPrompt(
   context: RunContext,
   userMessage: string | null = null,
 ): string {
+  if (command === "chat") {
+    return userMessage?.trim() || "Start an OpenWiki chat.";
+  }
+
   if (command === "init") {
     return appendUserMessage(
       `
