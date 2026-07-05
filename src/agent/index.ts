@@ -5,7 +5,12 @@ import { ChatAnthropic } from "@langchain/anthropic";
 import { SqliteSaver } from "@langchain/langgraph-checkpoint-sqlite";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatOpenRouter } from "@langchain/openrouter";
-import { createDeepAgent, LocalShellBackend } from "deepagents";
+import {
+  createDeepAgent,
+  LocalShellBackend,
+  type ReadResult,
+  type ReadRawResult,
+} from "deepagents";
 import { loadOpenWikiEnv, openWikiEnvDir } from "../env.js";
 import { createSystemPrompt, createUserPrompt } from "./prompt.js";
 import type {
@@ -38,6 +43,49 @@ import {
   createRunContext,
   writeLastUpdateMetadata,
 } from "./utils.js";
+
+/**
+ * Backend that refuses to read non-text (binary) files.
+ *
+ * deepagents' read_file tool returns binary file contents as a base64
+ * `file`/document content block. For anything that isn't a PDF/image/audio/video,
+ * the Anthropic API rejects the request ("media_type: Input should be
+ * 'application/pdf'"), which aborts the whole run when the agent happens to read
+ * an archive, office doc, tarball, or other binary artifact in the repo.
+ *
+ * deepagents' own reader returns text as a string and binary as a Uint8Array, so
+ * we detect binary by content type and return a plain text error instead. The
+ * read_file tool short-circuits on `{ error }` and never builds the bad block.
+ */
+class TextOnlyLocalShellBackend extends LocalShellBackend {
+  #binaryError(filePath: string): string {
+    return `Skipped '${filePath}': OpenWiki does not read binary/non-text files. Use ls or grep for these paths.`;
+  }
+
+  async read(filePath: string, offset?: number, limit?: number): Promise<ReadResult> {
+    const result = await super.read(filePath, offset, limit);
+    if (
+      "content" in result &&
+      result.content != null &&
+      typeof result.content !== "string"
+    ) {
+      return { error: this.#binaryError(filePath) };
+    }
+    return result;
+  }
+
+  async readRaw(filePath: string): Promise<ReadRawResult> {
+    const result = await super.readRaw(filePath);
+    if (
+      "data" in result &&
+      result.data?.content != null &&
+      typeof result.data.content !== "string"
+    ) {
+      return { error: this.#binaryError(filePath) };
+    }
+    return result;
+  }
+}
 
 export async function runOpenWikiAgent(
   command: OpenWikiCommand,
@@ -181,7 +229,7 @@ async function runOpenWikiAgentCore(
     model,
     tools: [],
     checkpointer,
-    backend: new LocalShellBackend({
+    backend: new TextOnlyLocalShellBackend({
       maxOutputBytes: 100_000,
       rootDir: cwd,
       timeout: 120,
